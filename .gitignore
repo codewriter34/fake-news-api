@@ -1,0 +1,20 @@
+# Secrets — never commit these
+.env
+*.pth
+*.pt
+*.bin
+
+# Model cache
+models/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db

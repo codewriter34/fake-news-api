@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  fake-news-api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_REPO=${HF_REPO}
+    volumes:
+      # Cache downloaded models between restarts — saves time and bandwidth
+      - ./models:/app/models
+    restart: unless-stopped
+    # Uncomment below if testing with a local GPU
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
