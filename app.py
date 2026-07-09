@@ -28,8 +28,8 @@ if torch.cuda.is_available():
 MODELS_DIR = Path("models")
 MODELS_DIR.mkdir(exist_ok=True)
 
-HF_REPO  = os.environ.get("HF_REPO", "YOUR_HF_USERNAME/fake-news-models")
-HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_REPO = "swanky237/fake-news-models"
+HF_TOKEN = None
 
 
 # ── Model Definitions ─────────────────────────────────────────
