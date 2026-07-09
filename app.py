@@ -1,280 +1,608 @@
 import os
 import io
 import time
+import logging
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-from pathlib import Path
+import torchvision.models as models
+import torchvision.transforms as transforms
+
 from PIL import Image
+
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import torchvision.models as models
-import torchvision.transforms as transforms
-from transformers import BertTokenizer, BertModel, AutoTokenizer, AutoModel
-from huggingface_hub import hf_hub_download
-import logging
 
-# ── Logging ───────────────────────────────────────────────────
+from transformers import (
+    BertTokenizer,
+    BertModel,
+    AutoTokenizer,
+    AutoModel
+)
+
+from huggingface_hub import hf_hub_download
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Device — auto GPU if available ───────────────────────────
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logger.info(f"Running on: {DEVICE}")
-if torch.cuda.is_available():
-    logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-    logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+# ============================================================
+# DEVICE
+# ============================================================
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+logger.info(f"Device: {DEVICE}")
+
+
+# ============================================================
+# PATHS
+# ============================================================
 
 MODELS_DIR = Path("models")
 MODELS_DIR.mkdir(exist_ok=True)
 
 HF_REPO = "swanky237/fake-news-models"
-HF_TOKEN = None
 
 
-# ── Model Definitions ─────────────────────────────────────────
+# ============================================================
+# MODEL DEFINITIONS
+# EXACT COPY OF TRAINING MODEL
+# ============================================================
+
+
 class MultimodalFakeDetector(nn.Module):
-    def __init__(self):
+
+    def __init__(
+        self,
+        bert_name="bert-base-uncased",
+        num_classes=2,
+        dropout=0.3,
+        fusion_dim=768
+    ):
+
         super().__init__()
-        self.bert = BertModel.from_pretrained("bert-base-uncased")
-        resnet = models.resnet50(pretrained=False)
-        self.resnet = nn.Sequential(*list(resnet.children())[:-1])
-        self.classifier = nn.Sequential(
-            nn.Linear(768 + 2048, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, 2)
+
+        self.bert = BertModel.from_pretrained(
+            bert_name
         )
 
-    def forward(self, input_ids, attention_mask, pixel_values=None):
-        text_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        text_feat = text_out.pooler_output
+        self.bert_output_dim = 768
+
+
+        res = models.resnet50(
+            weights=None
+        )
+
+        self.cnn = nn.Sequential(
+            *list(res.children())[:-1]
+        )
+
+        self.resnet_output_dim = 2048
+
+
+        self.text_proj = nn.Linear(
+            self.bert_output_dim,
+            fusion_dim
+        )
+
+
+        self.vision_proj = nn.Linear(
+            self.resnet_output_dim,
+            fusion_dim
+        )
+
+
+        self.attention_weights_linear = nn.Linear(
+            fusion_dim * 2,
+            fusion_dim * 2
+        )
+
+
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(
+                fusion_dim * 2,
+                num_classes
+            )
+        )
+
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        pixel_values=None
+    ):
+
+
+        text = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+
+        cls_vec = text.last_hidden_state[:,0,:]
+
+
+        t_prime = self.text_proj(
+            cls_vec
+        )
+
+
         if pixel_values is not None:
-            img_feat = self.resnet(pixel_values).squeeze(-1).squeeze(-1)
+
+            img = self.cnn(
+                pixel_values
+            )
+
+            img = img.view(
+                img.size(0),
+                -1
+            )
+
+
+            v_prime = self.vision_proj(
+                img
+            )
+
         else:
-            img_feat = torch.zeros(input_ids.size(0), 2048, device=DEVICE)
-        combined = torch.cat([text_feat, img_feat], dim=1)
-        return self.classifier(combined)
+
+            v_prime = torch.zeros(
+                input_ids.size(0),
+                768,
+                device=input_ids.device
+            )
+
+
+        fused = torch.cat(
+            [
+                t_prime,
+                v_prime
+            ],
+            dim=1
+        )
+
+
+        attention = self.attention_weights_linear(
+            fused
+        )
+
+
+        weights = torch.softmax(
+            attention,
+            dim=1
+        )
+
+
+        fused = fused * weights
+
+
+        return self.head(
+            fused
+        )
+
+
+
+# ============================================================
+# CAMEROON MODEL
+# ============================================================
 
 
 class XMRCameroonClassifier(nn.Module):
+
     def __init__(self):
+
         super().__init__()
-        self.xlmr = AutoModel.from_pretrained("xlm-roberta-base")
-        self.classifier = nn.Linear(768, 2)
 
-    def forward(self, input_ids, attention_mask):
-        out = self.xlmr(input_ids=input_ids, attention_mask=attention_mask)
-        return self.classifier(out.pooler_output)
+        self.xlmr = AutoModel.from_pretrained(
+            "xlm-roberta-base"
+        )
+
+        self.classifier = nn.Linear(
+            768,
+            2
+        )
 
 
-# ── Download models from HF Hub ───────────────────────────────
-def download_model(filename: str):
-    dest = MODELS_DIR / filename
-    if dest.exists():
-        logger.info(f"{filename} already on disk — skipping download")
+    def forward(
+        self,
+        input_ids,
+        attention_mask
+    ):
+
+        output = self.xlmr(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+
+        return self.classifier(
+            output.pooler_output
+        )
+
+
+
+# ============================================================
+# DOWNLOAD MODELS
+# ============================================================
+
+
+def download_model(filename):
+
+    path = MODELS_DIR / filename
+
+
+    if path.exists():
+
+        logger.info(
+            f"{filename} already exists"
+        )
+
         return
-    logger.info(f"Downloading {filename} from Hugging Face Hub...")
-    start = time.time()
+
+
     hf_hub_download(
         repo_id=HF_REPO,
         filename=filename,
-        token=HF_TOKEN,
-        local_dir=str(MODELS_DIR),
+        local_dir=str(MODELS_DIR)
     )
-    elapsed = time.time() - start
-    size_mb = (MODELS_DIR / filename).stat().st_size / 1e6
-    logger.info(f"{filename} downloaded — {size_mb:.1f} MB in {elapsed:.1f}s ✅")
+
+
+
+# ============================================================
+# LOAD EVERYTHING
+# ============================================================
 
 
 def load_models():
-    global multimodal_model, cameroon_model, bert_tokenizer, xlmr_tokenizer, eval_img_tf
 
-    download_model("fakeddit_multimodal_evaluated_87.pth")
-    download_model("xlmr_cameroon_best.pth")
+    global multimodal_model
+    global cameroon_model
+    global bert_tokenizer
+    global xlmr_tokenizer
+    global image_transform
 
-    logger.info("Loading tokenizers...")
-    bert_tokenizer  = BertTokenizer.from_pretrained("bert-base-uncased")
-    xlmr_tokenizer  = AutoTokenizer.from_pretrained("xlm-roberta-base")
 
-    logger.info("Loading MultimodalFakeDetector (BERT + ResNet50)...")
-    multimodal_model = MultimodalFakeDetector().to(DEVICE)
-    ckpt = torch.load(
+    download_model(
+        "fakeddit_multimodal_evaluated_87.pth"
+    )
+
+
+    download_model(
+        "xlmr_cameroon_best.pth"
+    )
+
+
+
+    bert_tokenizer = BertTokenizer.from_pretrained(
+        "bert-base-uncased"
+    )
+
+
+    xlmr_tokenizer = AutoTokenizer.from_pretrained(
+        "xlm-roberta-base"
+    )
+
+
+    logger.info(
+        "Loading multimodal model..."
+    )
+
+
+    multimodal_model = MultimodalFakeDetector().to(
+        DEVICE
+    )
+
+
+    checkpoint = torch.load(
         MODELS_DIR / "fakeddit_multimodal_evaluated_87.pth",
         map_location=DEVICE
     )
-    multimodal_model.load_state_dict(ckpt.get("model_state_dict", ckpt))
-    multimodal_model.eval()
-    logger.info("MultimodalFakeDetector ready ✅")
 
-    logger.info("Loading XMRCameroonClassifier (XLM-RoBERTa)...")
-    cameroon_model = XMRCameroonClassifier().to(DEVICE)
-    ckpt2 = torch.load(
+
+    if "model_state_dict" in checkpoint:
+
+        checkpoint = checkpoint["model_state_dict"]
+
+
+    multimodal_model.load_state_dict(
+        checkpoint
+    )
+
+
+    multimodal_model.eval()
+
+
+
+    logger.info(
+        "Loading Cameroon XLM-R..."
+    )
+
+
+    cameroon_model = XMRCameroonClassifier().to(
+        DEVICE
+    )
+
+
+    checkpoint = torch.load(
         MODELS_DIR / "xlmr_cameroon_best.pth",
         map_location=DEVICE
     )
-    cameroon_model.load_state_dict(ckpt2.get("model_state_dict", ckpt2))
+
+
+    if "model_state_dict" in checkpoint:
+
+        checkpoint = checkpoint["model_state_dict"]
+
+
+    cameroon_model.load_state_dict(
+        checkpoint
+    )
+
+
     cameroon_model.eval()
-    logger.info("XMRCameroonClassifier ready ✅")
-
-    eval_img_tf = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-
-    if torch.cuda.is_available():
-        logger.info(f"VRAM used after loading: "
-                    f"{torch.cuda.memory_allocated() / 1e9:.2f} GB / "
-                    f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-
-    logger.info("All models loaded and ready 🚀")
 
 
-# Load at startup
+
+    image_transform = transforms.Compose(
+        [
+            transforms.Resize((224,224)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                [
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                [
+                    0.229,
+                    0.224,
+                    0.225
+                ]
+            )
+        ]
+    )
+
+
+    logger.info(
+        "ALL MODELS READY"
+    )
+
+
+
 load_models()
 
 
-# ── FastAPI App ───────────────────────────────────────────────
+
+# ============================================================
+# FASTAPI
+# ============================================================
+
+
 app = FastAPI(
-    title="Cameroon Fake News Detector API",
-    description="Multimodal fake news detection using BERT+ResNet50 and XLM-RoBERTa, "
-                "fine-tuned on Fakeddit and Cameroon fact-check data.",
-    version="1.0.0",
+    title="Cameroon Fake News Detector",
+    version="1.0"
 )
+
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ── Endpoints ─────────────────────────────────────────────────
+
 @app.get("/")
-def root():
+def home():
+
     return {
-        "status": "online",
-        "device": str(DEVICE),
-        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-        "models": {
-            "cameroon": "XLM-RoBERTa fine-tuned on Cameroon fact-checks",
-            "multimodal": "BERT + ResNet50 trained on Fakeddit dataset",
-        },
-        "endpoints": {
-            "POST /predict": "Detect fake news from text (+ optional image)",
-            "GET  /health":  "Service health check",
-        }
+        "status":"online",
+        "device":str(DEVICE)
     }
+
 
 
 @app.get("/health")
 def health():
+
     return {
-        "status": "healthy",
-        "device": str(DEVICE),
-        "cuda_available": torch.cuda.is_available(),
-        "models_loaded": True,
+        "status":"healthy",
+        "models_loaded":True
     }
+
 
 
 @app.post("/predict")
 async def predict(
-    text: str = Form(..., description="News article text or headline to analyse"),
-    image: UploadFile = File(None, description="Optional image (JPEG/PNG)"),
+
+    text:str = Form(...),
+
+    image:UploadFile = File(None)
+
 ):
+
+
     if not text.strip():
-        raise HTTPException(status_code=400, detail="Text field cannot be empty.")
 
-    start_time = time.time()
-
-    # ── Cameroon XLM-R prediction ─────────────────────────────
-    try:
-        enc = xlmr_tokenizer(
-            text,
-            max_length=256,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
+        raise HTTPException(
+            400,
+            "Empty text"
         )
-        with torch.no_grad():
-            logits = cameroon_model(
-                enc["input_ids"].to(DEVICE),
-                enc["attention_mask"].to(DEVICE),
+
+
+    start=time.time()
+
+
+
+    # -----------------------------
+    # Cameroon model
+    # -----------------------------
+
+
+    cam = xlmr_tokenizer(
+        text,
+        max_length=256,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt"
+    )
+
+
+    with torch.no_grad():
+
+        logits = cameroon_model(
+            cam["input_ids"].to(DEVICE),
+            cam["attention_mask"].to(DEVICE)
+        )
+
+
+    probs=torch.softmax(
+        logits,
+        dim=1
+    )[0]
+
+
+    cam_result={
+
+        "verdict":
+            "Fake" if probs[1]>probs[0]
+            else "Real",
+
+        "fake_probability":
+            round(float(probs[1])*100,2),
+
+        "real_probability":
+            round(float(probs[0])*100,2)
+
+    }
+
+
+
+    # -----------------------------
+    # Multimodal model
+    # -----------------------------
+
+
+    tok = bert_tokenizer(
+        text,
+        max_length=128,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt"
+    )
+
+
+    pixels=None
+
+    image_used=False
+
+
+
+    if image:
+
+        data=await image.read()
+
+        img=Image.open(
+            io.BytesIO(data)
+        ).convert("RGB")
+
+
+        pixels=image_transform(
+            img
+        ).unsqueeze(0).to(DEVICE)
+
+
+        image_used=True
+
+
+
+    with torch.no_grad():
+
+        logits=multimodal_model(
+            tok["input_ids"].to(DEVICE),
+            tok["attention_mask"].to(DEVICE),
+            pixels
+        )
+
+
+    probs=torch.softmax(
+        logits,
+        dim=1
+    )[0]
+
+
+    multi_result={
+
+        "verdict":
+            "Fake" if probs[1]>probs[0]
+            else "Real",
+
+        "fake_probability":
+            round(float(probs[1])*100,2),
+
+        "real_probability":
+            round(float(probs[0])*100,2),
+
+        "image_used":
+            image_used
+
+    }
+
+
+
+    combined=round(
+        (
+            multi_result["fake_probability"]
+            +
+            cam_result["fake_probability"]
+
+        )/2,
+        2
+    )
+
+
+    return JSONResponse(
+
+        {
+
+        "success":True,
+
+        "text":
+            text[:200],
+
+        "cameroon_model":
+            cam_result,
+
+        "multimodal_model":
+            multi_result,
+
+
+        "combined_fake_probability":
+            combined,
+
+
+        "final_verdict":
+            "Fake" if combined>50 else "Real",
+
+
+        "inference_ms":
+            round(
+                (time.time()-start)*1000,
+                2
             )
-            probs = torch.softmax(logits, dim=1)[0].tolist()
 
-        cameroon_result = {
-            "verdict":    "Fake" if probs[1] > probs[0] else "Real",
-            "confidence": round(max(probs) * 100, 2),
-            "fake_prob":  round(probs[1] * 100, 2),
-            "real_prob":  round(probs[0] * 100, 2),
-            "model":      "XLM-RoBERTa (Cameroon fine-tuned)",
         }
-    except Exception as e:
-        logger.error(f"Cameroon model error: {e}")
-        cameroon_result = {"error": str(e)}
 
-    # ── Multimodal BERT + ResNet prediction ───────────────────
-    try:
-        enc2 = bert_tokenizer(
-            text,
-            max_length=128,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        pixel_values = None
-        has_image = False
-
-        if image and image.filename:
-            contents = await image.read()
-            if contents:
-                img = Image.open(io.BytesIO(contents)).convert("RGB")
-                pixel_values = eval_img_tf(img).unsqueeze(0).to(DEVICE)
-                has_image = True
-
-        with torch.no_grad():
-            logits2 = multimodal_model(
-                enc2["input_ids"].to(DEVICE),
-                enc2["attention_mask"].to(DEVICE),
-                pixel_values,
-            )
-            probs2 = torch.softmax(logits2, dim=1)[0].tolist()
-
-        multimodal_result = {
-            "verdict":    "Fake" if probs2[1] > probs2[0] else "Real",
-            "confidence": round(max(probs2) * 100, 2),
-            "fake_prob":  round(probs2[1] * 100, 2),
-            "real_prob":  round(probs2[0] * 100, 2),
-            "image_used": has_image,
-            "model":      "BERT + ResNet50 (Fakeddit trained)",
-        }
-    except Exception as e:
-        logger.error(f"Multimodal model error: {e}")
-        multimodal_result = {"error": str(e)}
-
-    elapsed_ms = round((time.time() - start_time) * 1000, 1)
-
-    # ── Combined verdict ──────────────────────────────────────
-    # Average both model fake probabilities for a combined score
-    combined_fake = None
-    if "fake_prob" in cameroon_result and "fake_prob" in multimodal_result:
-        combined_fake = round(
-            (cameroon_result["fake_prob"] + multimodal_result["fake_prob"]) / 2, 2
-        )
-
-    return JSONResponse({
-        "success": True,
-        "text_analysed": text[:200] + "..." if len(text) > 200 else text,
-        "cameroon_model":   cameroon_result,
-        "multimodal_model": multimodal_result,
-        "combined_fake_probability": combined_fake,
-        "overall_verdict": (
-            "Fake" if combined_fake and combined_fake > 50 else "Real"
-        ) if combined_fake is not None else None,
-        "inference_time_ms": elapsed_ms,
-        "device_used": str(DEVICE),
-    })
+    )
